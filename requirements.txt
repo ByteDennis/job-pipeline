@@ -1,0 +1,21 @@
+# Core dependencies
+sqlalchemy>=2.0.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+loguru>=0.7.0
+
+# Testing
+pytest>=7.0.0
+pytest-cov>=4.0.0
+
+# Jupyter
+notebook>=7.0.0
+ipykernel>=6.0.0
+
+# Database connectors (for future implementation)
+# pyathena>=3.0.0  # AWS Athena
+# cx_Oracle>=8.0.0  # Oracle PCDS
+
+# Utilities
+python-dotenv>=1.0.0
+tqdm>=4.65.0
