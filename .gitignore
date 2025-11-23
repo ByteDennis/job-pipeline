@@ -26,9 +26,9 @@ logs/
 # Output files
 output/
 files/outputs/
-*.xlsx
+# *.xlsx
 *.csv
-*.json
+# *.json
 
 # IDE
 .vscode/
@@ -56,7 +56,7 @@ htmlcov/
 
 # Old implementation
 old/
+new___
 services/
 files/
 db/
-new/*.md

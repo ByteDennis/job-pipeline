@@ -1,19 +1,105 @@
 """
-SQL Normalization Functions for Hash Comparison
+Utility functions for data validation pipeline
 
-This module provides robust normalization functions for both Oracle (PCDS) and AWS Athena
-to ensure consistent hash computation across platforms.
-
-Key principles:
-- Trim whitespace
-- Convert to uppercase for string comparison
-- Handle NULL values consistently
-- Normalize dates to ISO format
-- Normalize numbers to consistent precision
-- Handle special characters
+Includes:
+- SQL normalization for hash comparison
+- Excel/JSON IO helpers
+- Data cleaning and parsing functions
 """
 
+import re
+import json
+import warnings
+import pandas as pd
+import numpy as np
 from typing import Dict, List
+from pathlib import Path
+
+
+NO_DATE = pd.NaT
+DATE_FMT = '%Y-%m-%d'
+
+# Column mapping as a constant for easy maintenance
+COLUMN_MAP: Dict[str, str] = {
+    "Enabled": "enabled",
+    "Tables  requested by business": "tables_requested",
+    "Column Mapping  Name": "col_map",
+    "PCDS Table Details with DB Name": "pcds_tbl",
+    "PCDS Server Information": "pcds_svc",
+    "Tables delivered in  AWS with DB Name": "aws_tbl",
+    "PCDS Inspect Variable": "pcds_var",
+    "AWS Inspect Variable": "aws_var",
+    "PCDS Filter": "pcds_where",
+    "AWS Filter": "aws_where",
+    "Start Date": "start_dt",
+    "End Date": "end_dt",
+    "Partition": "partition"
+}
+
+
+def clean_string(x):
+    """Trim whitespace if string"""
+    return x.strip() if isinstance(x, str) else x
+
+
+def extract_name(name):
+    """Remove parentheses content and trim"""
+    if pd.isna(name): return pd.NA
+    if not isinstance(name, str): return name
+    return re.sub(r'\(.*\)', '', name).strip()
+
+
+def merge_pcds_svc_tbl(df: pd.DataFrame) -> pd.DataFrame:
+    """Merge PCDS service and table info, fill missing dates and filters"""
+    def format_date(x):
+        return x.strftime(DATE_FMT) if pd.notna(x) else x
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', pd.errors.SettingWithCopyWarning)
+        df = df.copy()
+        cols = [x for x in df.columns if x not in ('pcds_var', 'aws_var', 'pcds_where', 'aws_where')]
+        df[cols] = df[cols].map(extract_name)
+
+        tbl = df.pop('pcds_tbl')
+        df['col_map'] = df['col_map'].fillna(tbl)
+        svc = df.pop('pcds_svc').fillna('no_server_provided')
+        df['pcds_tbl'] = svc + '.' + tbl.str.lower()
+        df[['pcds_var', 'aws_var']] = df[['pcds_var', 'aws_var']].fillna(NO_DATE)
+        df[['start_dt', 'end_dt']] = df[['start_dt', 'end_dt']].map(format_date)
+        df[['pcds_where','aws_where']] = df[['pcds_where','aws_where']].replace(np.nan, None)
+        return df
+
+
+def read_excel_input(excel_path: str, excel_sheet: str) -> pd.DataFrame:
+    """Read and clean Excel input, apply column mapping, filter enabled rows"""
+    try:
+        df = pd.read_excel(excel_path, sheet_name=excel_sheet, usecols=list(COLUMN_MAP))
+        df = df.rename(columns=COLUMN_MAP).map(clean_string)
+        df = df[df['enabled'].str.lower() == 'yes']
+        df = merge_pcds_svc_tbl(df)
+        return df
+    except Exception as e:
+        raise RuntimeError(f"Failed to read Excel file {excel_path}: {e}")
+
+
+def write_json(file, data, cls=None):
+    """Write data to JSON file"""
+    with open(file, 'w') as f:
+        json.dump(data, f, indent=2, cls=cls)
+
+
+def read_json(file):
+    """Read data from JSON file"""
+    with open(file, 'r') as fp:
+        data = json.load(fp)
+    return data
+
+
+def delete_file(file):
+    """Delete file if it exists"""
+    filepath = Path(file)
+    if filepath.exists():
+        filepath.unlink()
 
 
 def normalize_oracle_column(column_name: str, data_type: str) -> str:
