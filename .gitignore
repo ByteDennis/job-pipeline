@@ -55,8 +55,8 @@ htmlcov/
 *.sas7bdat
 
 # Old implementation
-old/
-new___
+src/
 services/
 files/
 db/
+old/
