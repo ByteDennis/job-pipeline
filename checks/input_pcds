@@ -1,0 +1,15 @@
+# PCDS Oracle Database Credentials
+PCDS_USR=demo_user
+PCDS_PWD=demo_password
+PCDS_PATH=demo_oracle_server:1521/PCDS_PROD
+
+# AWS Athena Configuration
+AWS_REGION=us-east-1
+AWS_ACCESS_KEY_ID=your_access_key_here
+AWS_SECRET_ACCESS_KEY=your_secret_key_here
+AWS_S3_STAGING_DIR=s3://your-bucket/athena-results/
+
+# Running State
+RUN_NAME=demo
+S3_BUCKET=s3://your-bucke-to-save-intermediate-results
+CATEGORY=dpst # or loan

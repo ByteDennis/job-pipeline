@@ -1,0 +1,7 @@
+# AWS Athena Configuration
+AWS_REGION=us-east-1
+
+# Running State
+RUN_NAME=demo
+S3_BUCKET=s3://your-bucke-to-save-intermediate-results
+CATEGORY=dpst # or loan
