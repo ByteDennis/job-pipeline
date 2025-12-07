@@ -11,5 +11,5 @@ AWS_S3_STAGING_DIR=s3://your-bucket/athena-results/
 
 # Running State
 RUN_NAME=demo
-S3_BUCKET=s3://your-bucke-to-save-intermediate-results
 CATEGORY=dpst # or loan
+META_CHECK_CFG=configs/meta_check_dpst.toml

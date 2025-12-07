@@ -12,19 +12,15 @@ from loguru import logger
 from tqdm import tqdm
 from dotenv import load_dotenv
 
-# Add paths for imports
-sys.path.insert(0, str(Path(__file__).parent.parent / 'common'))
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'src'))
-
-from config_loader import (
+from checks.util_config import (
     get_input_tables,
     get_column_mappings,
     query_pcds,
     query_aws,
     is_missing
 )
-from s3_utils import create_s3_manager
-from excel_reporter import ExcelReporter
+from checks.util_s3 import create_s3_manager
+from checks.utils_xlsx import ExcelReporter
 
 
 #>>> Meta Check class - comprehensive table validation <<<#

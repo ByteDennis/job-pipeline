@@ -58,7 +58,11 @@ htmlcov/
 services/
 files/
 db/
+src/
 obsolete_*/
 steps/README_DATA_FORMATS.md
-src/
 steps/
+notebooks/
+notebook/
+inputs/
+configs/

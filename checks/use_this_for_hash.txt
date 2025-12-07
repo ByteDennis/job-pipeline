@@ -1,0 +1,193 @@
+
+# -----------------------
+# Normalization helpers
+# -----------------------
+
+def normalize_oracle_column(column_name: str, data_type: str, decimals: int = 3) -> str:
+    """
+    Oracle normalization:
+      - Numbers: NULL or 0 (incl. 0.0, -0.0) -> '0'; non-zero -> fixed-decimal string (NLS-independent).
+      - Strings: sanitize; pseudo-null tokens -> NULL.
+      - DATE: NULL -> NULL; else 'YYYY-MM-DD'.
+      - TIMESTAMP: NULL -> NULL; else 'YYYY-MM-DD HH24:MI:SS.FF3'.
+      - Binary: NULL -> NULL; else HEX.
+
+    Returns an Oracle SQL expression that yields a *scalar value* (possibly NULL).
+    """
+    dt = data_type.upper()
+    dec_zeros = '0' * decimals
+    # Numeric mask with literal '.' so it's NLS-independent
+    num_mask = f"FM9999999999999990.{dec_zeros}"
+
+    # Text sanitizer: UPPER/TRIM, remove control chars [0x00-0x1F,0x7F], collapse spaces
+    text_sanitizer = (
+        f"REGEXP_REPLACE("
+        f"REGEXP_REPLACE(UPPER(TRIM({column_name})), '[[:cntrl:]]', ''),"
+        f"'[[:space:]]+', ' ')"
+    )
+    pseudo_null_to_null = (
+        f"CASE WHEN {text_sanitizer} IN ('', 'NULL','NUL','NONE','N/A','<NA>','EMPTY','NIL','.') "
+        f"THEN NULL ELSE {text_sanitizer} END"
+    )
+
+    # Numeric-like types
+    if any(t in dt for t in ['NUMBER','NUMERIC','INTEGER','INT','FLOAT','DOUBLE','DECIMAL']):
+        return (
+            f"CASE WHEN {column_name} IS NULL OR {column_name} = 0 THEN '0' "
+            f"ELSE REPLACE(TO_CHAR(ROUND({column_name}, {decimals}), '{num_mask}'), ',', '.') END"
+        )
+
+    # String-like types
+    if any(t in dt for t in ['VARCHAR','CHAR','RAW', 'VARCHAR2']):
+        return pseudo_null_to_null
+
+    # DATE
+    if 'DATE' in dt and 'TIMESTAMP' not in dt:
+        return f"CASE WHEN {column_name} IS NULL THEN NULL ELSE TO_CHAR({column_name}, 'YYYY-MM-DD') END"
+
+    # TIMESTAMP
+    if 'TIMESTAMP' in dt:
+        return f"CASE WHEN {column_name} IS NULL THEN NULL ELSE TO_CHAR({column_name}, 'YYYY-MM-DD HH24:MI:SS.FF3') END"
+
+    # Default → treat as string-like
+    return pseudo_null_to_null
+
+
+def normalize_athena_column(column_name: str, data_type: str, decimals: int = 3) -> str:
+    """
+    Athena (Presto/Trino) normalization:
+      - Numbers: NULL or 0 (incl. 0.0, -0.0) -> '0'; non-zero -> fixed-decimal string via FORMAT.
+      - Strings: sanitize; pseudo-null tokens -> NULL.
+      - DATE: NULL -> NULL; else '%Y-%m-%d'.
+      - TIMESTAMP: NULL -> NULL; else 'yyyy-MM-dd HH:mm:ss.SSS'.
+      - Binary: NULL -> NULL; else TO_HEX.
+
+    Returns an Athena SQL expression that yields a *scalar value* (possibly NULL).
+    """
+    dt = data_type.lower()
+    printf = f"%.{decimals}f"
+
+    # Text sanitizer
+    base = f"upper(trim({column_name}))"
+    rm_ctrl = f"regexp_replace({base}, '\\\\p{{Cntrl}}', '')"
+    collapse = f"regexp_replace({rm_ctrl}, '\\\\s+', ' ')"
+    pseudo_null_to_null = (
+        f"CASE WHEN {collapse} IN ('', 'NULL','NUL','NONE','N/A','<NA>','EMPTY','NIL','.') "
+        f"THEN NULL ELSE {collapse} END"
+    )
+
+    if any(t in dt for t in ['bigint','int','integer','double','float', 'decimal']):
+        return (
+            f"CASE WHEN {column_name} IS NULL OR CAST({column_name} AS DOUBLE) = 0 THEN '0' "
+            f"ELSE FORMAT('{printf}', CAST({column_name} AS DOUBLE)) END"
+        )
+
+    if any(t in dt for t in ['string','varchar','char']):
+        return pseudo_null_to_null
+
+    if dt == 'date':
+        return f"CASE WHEN {column_name} IS NULL THEN NULL ELSE DATE_FORMAT({column_name}, '%Y-%m-%d') END"
+
+    if 'timestamp' in dt:
+        return f"CASE WHEN {column_name} IS NULL THEN NULL ELSE format_datetime({column_name}, 'yyyy-MM-dd HH:mm:ss.SSS') END"
+
+    return pseudo_null_to_null
+
+
+# -----------------------
+# Expression builders
+# -----------------------
+
+def build_oracle_hash_expr(
+    columns: List[Dict[str, str]],
+    separator: str = '|',
+):
+    """
+    Build Oracle SHA-256 hash expression for multiple columns, with optional debug output.
+
+    Args:
+        columns: List of dicts with keys {'column_name': str, 'data_type': str}
+        separator: Delimiter between normalized fields (default: '|')
+        debug: If True, returns a dict with hash_expr, concat_expr, and a debug SELECT list
+               that outputs expr(x) AS x for each normalized expression, plus concat/hash.
+
+    Returns:
+        str if debug=False:
+            RAWTOHEX(STANDARD_HASH(<concat_expr>, 'SHA256'))
+        dict if debug=True:
+            {
+              "hash_expr": "...",
+              "concat_expr": "...",
+              "debug_select": "expr1 AS \"col1\", expr2 AS \"col2\", ... , <concat_expr> AS \"__concat_string\", <hash_expr> AS \"__hash_hex\""
+            }
+    """
+    if not columns:
+        return {"hash_expr": "NULL", "concat_expr": "NULL", "debug_select": ""}
+
+    # Build normalized column expressions (your normalization function must exist)
+    normalized_exprs = [
+        normalize_oracle_column(col['column_name'], col['data_type'])
+        for col in columns
+    ]
+
+    # Concatenate with separator (Oracle string concatenation uses ||)
+    concat_expr = f" || '{separator}' || ".join(normalized_exprs)
+
+    # Hash: STANDARD_HASH returns RAW; RAWTOHEX gives hex string
+    hash_expr = f"RAWTOHEX(STANDARD_HASH({concat_expr}, 'SHA256'))"
+    # Debug SELECT list: show each normalized expression AS <column_name>
+    debug_pairs = [
+        f'{expr} AS "{col["column_name"]}"'
+        for expr, col in zip(normalized_exprs, columns)
+    ]
+    debug_pairs.append(f'{concat_expr} AS "__concat_string"')
+    debug_pairs.append(f'{hash_expr} AS "__hash_hex"')
+    debug_select_list = ",\n       ".join(debug_pairs)
+
+    return {
+        "hash_expr": hash_expr,
+        "concat_expr": concat_expr,
+        "debug_select": debug_select_list
+    }
+
+
+def build_athena_hash_expr(
+    columns: List[Dict[str, str]],
+    separator: str = '|',
+    decimals: int = 3,
+    null_sentinel: str = '',
+):
+    """
+    Build an Athena SHA-256 hash expression that:
+      - Normalizes each column
+      - Uses array_join to concatenate (avoids NULL propagation)
+      - Applies sentinel at concat time so final string is non-NULL
+      - Hashes via to_hex(sha256(to_utf8(...)))
+
+    Returns:
+      - str if debug=False
+      - dict if debug=True: { 'hash_expr', 'concat_expr', 'debug_select' }
+    """
+    if not columns:
+        return {"hash_expr": "NULL", "concat_expr": "NULL", "debug_select": ""}
+
+    norm_exprs = [normalize_athena_column(c['column_name'], c['data_type'], decimals) for c in columns]
+
+    # Apply sentinel at concat time; array_join treats NULLs as empty if you COALESCE
+    items = [f"COALESCE({e}, '{null_sentinel}')" for e in norm_exprs]
+    concat_expr = f"array_join(array[{', '.join(items)}], '{separator}')"
+
+    hash_expr = f"to_hex(sha256(to_utf8({concat_expr})))"
+
+    debug_pairs = [f'{e} AS "{c["column_name"]}"' for e, c in zip(norm_exprs, columns)]
+    debug_pairs.append(f'{concat_expr} AS "__concat_string"')
+    debug_pairs.append(f'{hash_expr} AS "__hash_hex"')
+    debug_select_list = ",\n       ".join(debug_pairs)
+
+    return {
+        "hash_expr": hash_expr,
+        "concat_expr": concat_expr,
+        "debug_select": debug_select_list
+    }
+1) S3Manager@s3_utils.py, allow step to be empty and normalize the S3 path and object key consistently before any operation
+4) table right aligned, especially the summary part

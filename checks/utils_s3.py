@@ -128,7 +128,10 @@ class S3Manager:
 
     #>>> Get full S3 path for a file: step='meta_check', filename='results.pq' <<<#
     def get_s3_path(self, step: str, filename: str) -> str:
-        return f"{self.base_path}/{step}/{filename}"
+        step = step.strip('/') if step else ''
+        if step:
+            return f"{self.base_path}/{step}/{filename}"
+        return f"{self.base_path}/{filename}"
 
     #>>> Upload DataFrame as parquet to S3 <<<#
     def upload_parquet(self, df: pd.DataFrame, step: str, filename: str) -> str:
@@ -178,13 +181,16 @@ class S3Manager:
         s3_path = self.get_s3_path(step, filename)
         logger.info(f"Uploading JSON to {s3_path}")
 
+        step = step.strip('/') if step else ''
+        key = f"{self.run_name}/{step}/{filename}" if step else f"{self.run_name}/{filename}"
+
         # awswrangler expects DataFrame for to_json, so we convert dict
         import json
         json_str = json.dumps(data, indent=2)
         aws.s3.put_object(
             body=json_str.encode('utf-8'),
             bucket=self.s3_bucket.replace('s3://', ''),
-            key=f"{self.run_name}/{step}/{filename}",
+            key=key,
             boto3_session=SESSION
         )
 
@@ -201,16 +207,57 @@ class S3Manager:
         s3_path = self.get_s3_path(step, filename)
         logger.info(f"Downloading JSON from {s3_path}")
 
+        step = step.strip('/') if step else ''
+        key = f"{self.run_name}/{step}/{filename}" if step else f"{self.run_name}/{filename}"
+
         import json
         obj = aws.s3.get_object(
             bucket=self.s3_bucket.replace('s3://', ''),
-            key=f"{self.run_name}/{step}/{filename}",
+            key=key,
             boto3_session=SESSION
         )
         data = json.loads(obj['Body'].read())
 
         logger.info(f"✓ Downloaded {filename}")
         return data
+
+    #>>> Upload CSV DataFrame to S3 <<<#
+    def upload_csv(self, df: pd.DataFrame, step: str, filename: str) -> str:
+        self._ensure_credentials()
+
+        if not filename.endswith('.csv'):
+            filename = f"{filename}.csv"
+
+        s3_path = self.get_s3_path(step, filename)
+        logger.info(f"Uploading CSV to {s3_path}")
+
+        aws.s3.to_csv(
+            df=df,
+            path=s3_path,
+            boto3_session=SESSION,
+            index=False
+        )
+
+        logger.info(f"✓ Uploaded {filename} to {s3_path} ({len(df)} rows)")
+        return s3_path
+
+    #>>> Download CSV file from S3 as DataFrame <<<#
+    def download_csv(self, step: str, filename: str) -> pd.DataFrame:
+        self._ensure_credentials()
+
+        if not filename.endswith('.csv'):
+            filename = f"{filename}.csv"
+
+        s3_path = self.get_s3_path(step, filename)
+        logger.info(f"Downloading CSV from {s3_path}")
+
+        df = aws.s3.read_csv(
+            path=s3_path,
+            boto3_session=SESSION
+        )
+
+        logger.info(f"✓ Downloaded {filename} ({len(df)} rows)")
+        return df
 
     #>>> Upload any file to S3 <<<#
     def upload_file(self, local_path: str, step: str, filename: str) -> str:
