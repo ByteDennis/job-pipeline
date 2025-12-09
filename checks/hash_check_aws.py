@@ -1,19 +1,17 @@
 """Part 2: AWS Hash Check - Compute row hashes per vintage with parallel execution and debug mode."""
+if __name__ == '__main__':
+    from dotenv import load_dotenv
+    load_dotenv('input_pcds')
+
 import os
-import json
+from upath import UPath
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from loguru import logger
-from utils_config import load_env, proc_aws
+
+import constant
+import utils_config as C
 from utils_s3 import S3Manager
 from utils_hash import build_athena_hash_expr
-
-#>>> Setup logger to output folder <<<#
-def add_logger(folder):
-    os.makedirs(folder, exist_ok=True)
-    logger.remove()
-    if os.path.exists(fpath := os.path.join(folder, 'events.log')):
-        os.remove(fpath)
-    logger.add(fpath, level='INFO', format='{time:YY-MM-DD HH:mm:ss} | {level} | {message}', mode='w')
 
 #>>> Compute hash for single vintage (worker function) <<<#
 def compute_vintage_hash(args):
@@ -30,7 +28,7 @@ def compute_vintage_hash(args):
         else:
             sql = f"SELECT {key_select}, {hash_result['hash_expr']} AS hash_value FROM {database}.{table_name} WHERE {where_clause}"
 
-        df = proc_aws(sql, data_base=database)
+        df = C.proc_aws(sql, data_base=database)
 
         if debug:
             return df.to_dict('records')
@@ -68,18 +66,19 @@ def compute_table_hashes(database, table_name, columns_with_types, key_columns, 
 
 #>>> Main execution <<<#
 def main(max_workers=1, debug=False):
-    env = load_env('input_aws')
-    run_name = env['RUN_NAME']
-    category = env['CATEGORY']
-    s3_bucket = env.get('S3_BUCKET', os.environ.get('S3_BUCKET'))
+    run_name, category, config_path = C.get_env('RUN_NAME', 'CATEGORY', 'HASH_STEP')
 
-    output_folder = f'output/{run_name}'
-    add_logger(output_folder)
-    logger.info(f"Starting AWS hash check: {run_name} / {category} (workers={max_workers}, debug={debug})")
+    cfg = C.load_config(config_path)
+    step_name = cfg.output.step_name.format(p='aws')
+    suffix = '_debug' if debug else ''
+    output_folder = cfg.output.disk.format(name=run_name)
+    C.add_logger(output_folder, name=f'{step_name}{suffix}')
+    logger.info(f"Starting AWS hash check: {run_name} | {category} (workers={max_workers}, debug={debug})")
 
-    s3 = S3Manager(s3_bucket, run_name)
-    consolidated = s3.download_json('', f'{category}_column_check.json')
+    s3_bucket = cfg.output.s3.format(name=run_name)
+    s3 = S3Manager(s3_bucket)
 
+    consolidated = s3.read_json(f'{cfg.output.summary.format(s="column")}.json')
     validated_tables = consolidated.get('validated_tables', [])
     logger.info(f"Processing {len(validated_tables)} validated tables")
 
@@ -123,14 +122,12 @@ def main(max_workers=1, debug=False):
 
         results.append(table_result)
 
-    suffix = '_debug' if debug else ''
-    local_path = os.path.join(output_folder, f'aws_{category}_hash{suffix}.json')
-    with open(local_path, 'w') as f:
-        json.dump(results, f, indent=2, default=str)
+    local_path = os.path.join(output_folder, f'{step_name}{suffix}.json')
+    s3.write_json(results, UPath(local_path))
     logger.info(f"Saved local copy to {local_path}")
 
-    s3_path = s3.upload_json(results, 'hash_check', f'aws_{category}_hash{suffix}.json')
-    logger.info(f"Uploaded to {s3_path}")
+    s3_path = s3.write_json(results, f'{step_name}{suffix}.json')
+    logger.info(f"Uploaded AWS hash check results to {s3_path}")
 
     return results
 

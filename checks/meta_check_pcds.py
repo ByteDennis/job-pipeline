@@ -1,25 +1,25 @@
 """Part 1: PCDS Meta Check - Check table accessibility, row counts, crosswalk mappings, and generate vintages then upload to S3."""
-import os
-import json
-import pandas as pd
-from loguru import logger
-from utils_config import load_env, get_config, get_input_tables, get_column_mappings, proc_pcds
-from utils_s3 import S3Manager
-from utils_date import parse_date_to_std, detect_date_format, generate_vintages
+if __name__ == '__main__':
+    from dotenv import load_dotenv
+    load_dotenv('input_pcds')
 
-#>>> Setup logger to output folder <<<#
-def add_logger(folder):
-    os.makedirs(folder, exist_ok=True)
-    logger.remove()
-    if os.path.exists(fpath := os.path.join(folder, 'events.log')):
-        os.remove(fpath)
-    logger.add(fpath, level='INFO', format='{time:YY-MM-DD HH:mm:ss} | {level} | {message}', mode='w')
+import os
+from upath import UPath
+import pandas as pd
+from operator import itemgetter
+from loguru import logger
+
+import constant
+import utils_config as C
+from utils_s3 import S3Manager
+from utils_date import parse_date_to_std, generate_vintages
+
 
 #>>> Check if table is accessible <<<#
 def check_accessible(conn, table_name):
     try:
         sql = f"SELECT 1 FROM {table_name} WHERE ROWNUM = 1"
-        proc_pcds(sql, service_name=conn)
+        C.proc_pcds(sql, service_name=conn)
         return True
     except Exception as e:
         logger.error(f"Table {table_name} not accessible: {e}")
@@ -27,22 +27,21 @@ def check_accessible(conn, table_name):
 
 #>>> Get row counts grouped by raw date variable <<<#
 def get_row_counts(conn, table_name, date_var, where_clause=None):
-    where = f"WHERE {where_clause}" if where_clause else ""
+    where = "" if C.is_missing(where_clause) else f"WHERE {where_clause}"
     sql = f"SELECT {date_var}, COUNT(*) as cnt FROM {table_name} {where} GROUP BY {date_var}"
-    df = proc_pcds(sql, service_name=conn)
-    df['date_std'] = df.iloc[:, 0].apply(parse_date_to_std)
+    df = C.proc_pcds(sql, service_name=conn)
+    df[date_var] = df[date_var].apply(parse_date_to_std)
     return df
 
 #>>> Get table columns with types <<<#
-def get_columns(conn, table_name):
-    svc, tbl = table_name.split('.')
+def get_columns(service_name, table_name):
     sql = f"""
     SELECT column_name, data_type
     FROM all_tab_columns
-    WHERE owner = UPPER('{svc}') AND table_name = UPPER('{tbl}')
+    WHERE table_name = UPPER('{table_name}')
     ORDER BY column_id
     """
-    return proc_pcds(sql, service_name=conn)
+    return C.proc_pcds(sql, service_name=service_name)
 
 #>>> Check crosswalk completeness <<<#
 def check_crosswalk(table_name, columns_df, crosswalk_df, col_map_name):
@@ -51,7 +50,7 @@ def check_crosswalk(table_name, columns_df, crosswalk_df, col_map_name):
 
     comparable, tokenized, pcds_only = [], [], []
     for _, row in mapped.iterrows():
-        pcds_col = row['pcds_col'].upper()
+        pcds_col = str(row.get("pcds_col", "")).strip().upper()
         if pcds_col in actual_cols:
             if row['is_tokenized']:
                 tokenized.append(pcds_col)
@@ -61,90 +60,101 @@ def check_crosswalk(table_name, columns_df, crosswalk_df, col_map_name):
                 pcds_only.append(pcds_col)
 
     unmapped = list(actual_cols - set(comparable) - set(tokenized) - set(pcds_only))
-    return {'comparable': comparable, 'tokenized': tokenized, 'pcds_only': pcds_only, 'unmapped': unmapped}
+    return {
+        'table': table_name,
+        'comparable': comparable, 
+        'tokenized': tokenized, 
+        'pcds_only': pcds_only, 
+        'unmapped': unmapped
+    }
 
 #>>> Generate vintages from row count data <<<#
-def get_vintages(row_counts_df, date_var, partition_type, db_type='oracle'):
-    if row_counts_df.empty or row_counts_df['date_std'].isna().all():
+def get_vintages(row_counts_df, date_var, partition_type):
+    var = date_var._var
+    if row_counts_df.empty or row_counts_df[var].isna().all():
         return []
-
-    min_date = row_counts_df['date_std'].min()
-    max_date = row_counts_df['date_std'].max()
-
-    var_type, var_format = detect_date_format(row_counts_df.iloc[:, 0].tolist())
-
-    return generate_vintages(min_date, max_date, partition_type, date_var, var_type, var_format, db_type)
+    min_date = row_counts_df[var].min()
+    max_date = row_counts_df[var].max()
+    return generate_vintages(min_date, max_date, partition_type, date_var)
 
 #>>> Main execution <<<#
 def main():
-    env = load_env('input_pcds')
-    run_name = env['RUN_NAME']
-    category = env['CATEGORY']
-    s3_bucket = env.get('S3_BUCKET', os.environ.get('S3_BUCKET'))
+    run_name, category, config_path = C.get_env('RUN_NAME', 'CATEGORY', 'META_STEP')
 
-    output_folder = f'output/{run_name}'
-    add_logger(output_folder)
-    logger.info(f"Starting PCDS meta check: {run_name} / {category}")
+    cfg = C.load_config(config_path)
+    step_name = cfg.output.step_name.format(p='pcds')
+    output_folder = cfg.output.disk.format(name=run_name)
+    C.add_logger(output_folder, name=step_name)
+    logger.info(f"Starting PCDS meta check: {run_name} | {category}")
 
-    config = get_config(category)
-    tables_df = get_input_tables(category)
-    crosswalk_df = get_column_mappings(category)
+    tables_df = C.read_input_tables(cfg.table)
+    crosswalk_df = C.load_column_mappings(cfg.column_maps, category)
 
     # Filter for enabled tables only
     enabled_tables = tables_df[tables_df['enabled']].copy()
-    logger.info(f"Found {len(enabled_tables)} enabled tables out of {len(tables_df)} total")
+    logger.info(f"Going to validate {len(enabled_tables)} tables out of {len(tables_df)} total")
 
     # Filter crosswalk for only enabled table mappings
-    enabled_col_maps = enabled_tables['col_map'].unique() if 'col_map' in enabled_tables.columns else enabled_tables['pcds_tbl'].str.split('.').str[-1].unique()
-    filtered_crosswalk = crosswalk_df[crosswalk_df['col_map'].isin(enabled_col_maps)].copy()
-    logger.info(f"Filtered crosswalk: {len(filtered_crosswalk)} mappings for {len(enabled_col_maps)} tables")
+    filtered_crosswalk = crosswalk_df[
+        crosswalk_df["col_map"].str.lower().isin(
+            (
+                enabled_tables["col_map"]
+                if "col_map" in enabled_tables.columns
+                else enabled_tables["pcds_tbl"].str.extract(r"([^.]+)$", expand=False)
+            ).str.lower().unique()
+        )
+    ].copy()
 
     # Upload filtered config files to S3 for other machines to use
-    s3 = S3Manager(s3_bucket, run_name)
-    s3.upload_csv(enabled_tables, '', 'input_tables.csv')
-    s3.upload_csv(filtered_crosswalk, '', 'crosswalk.csv')
-    logger.info("Uploaded filtered config files to S3 root")
+    s3_bucket = cfg.output.s3.format(name=run_name)
+    s3 = S3Manager(s3_bucket)
+    s3.write_df(enabled_tables, 'input_tables.csv')
+    s3.write_df(filtered_crosswalk, 'crosswalk.csv')
+    logger.info(f"Uploaded input_tables, crosswalk document to S3 {s3.base}")
 
     results = []
 
     for _, table in enabled_tables.iterrows():
-        table_name = table['pcds_tbl']
-        svc = table['pcds_svc']
-        date_var = table.get('pcds_var')
-        where_clause = table.get('pcds_where')
-        partition_type = table.get('partition', 'month')
-        col_map_name = table.get('col_map', table_name.split('.')[-1])
-
+        service_name, table_name = table['pcds_tbl'].split('.')
+        fetch = itemgetter('pcds_var', 'pcds_where', 'partition', 'col_map', 'start_dt', 'end_dt')
+        date_var, where_clause, partition_type, col_map_name, start_dt, end_dt = fetch(table)
         logger.info(f"Processing {table_name}")
-
         result = {
-            'table': table_name,
-            'accessible': check_accessible(svc, table_name),
+            'table': table_name.upper(),
+            'service': service_name,
+            'accessible': check_accessible(service_name, table_name),
             'row_counts': None,
             'crosswalk': None,
+            'column_types': None,
+            'date_var': None,
+            'where_clause': '',
             'vintages': []
         }
 
         if result['accessible']:
-            columns_df = get_columns(svc, table_name)
+            columns_df = get_columns(service_name, table_name)
             result['crosswalk'] = check_crosswalk(table_name, columns_df, filtered_crosswalk, col_map_name)
 
             column_types = dict(zip(columns_df['COLUMN_NAME'].str.upper(), columns_df['DATA_TYPE']))
             result['column_types'] = column_types
 
-            if date_var and not pd.isna(date_var):
-                row_counts_df = get_row_counts(svc, table_name, date_var, where_clause)
+            if date_var and not C.is_missing(date_var):
+                date_var = C.DateParser(date_var, column_types[date_var])
+                date_var.get_fmt(table_name, service_name)
+                where_clause = date_var.merge_where(start_dt, end_dt, where_clause)
+                row_counts_df = date_var.get_cnt(table_name, where_clause, service_name=service_name)
+                result['where_clause'] = where_clause
                 result['row_counts'] = row_counts_df.to_dict('records')
                 result['vintages'] = get_vintages(row_counts_df, date_var, partition_type)
+                result['date_var'] = date_var.to_json()
 
         results.append(result)
 
-    local_path = os.path.join(output_folder, f'pcds_{category}_meta.json')
-    with open(local_path, 'w') as f:
-        json.dump(results, f, indent=2)
+    local_path = os.path.join(output_folder, f'{step_name}.json')
+    s3.write_json(results, UPath(local_path))
     logger.info(f"Saved local copy to {local_path}")
 
-    s3_path = s3.upload_json(results, 'meta_check', f'pcds_{category}_meta.json')
+    s3_path = s3.write_json(results, f'{step_name}.json')
     logger.info(f"Uploaded PCDS meta check results to {s3_path}")
 
     return results

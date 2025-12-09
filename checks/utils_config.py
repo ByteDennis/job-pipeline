@@ -2,30 +2,28 @@
 # Contains all configuration and database functions (no end2end.py dependency)
 
 import os
-import sys
 import re
+import sys
 import warnings
-from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional, List
 from datetime import datetime, timedelta, date
 import pandas as pd
 import pandas.io.sql as psql
-from dateutil import parser
-from dotenv import load_dotenv
+from dataclasses import dataclass, asdict
+from dateutil import parser as date_parser
 from loguru import logger
 import tomllib
 import attridict
+import functools as ft
+import json
 
 # Import database libraries
 import oracledb
 from pyathena import connect as athena_connect_raw
 
-# Import utils
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'src'))
-import utils
-
 # Import from s3_utils for AWS credentials
-from s3_utils import aws_creds_renew, inWindows
+from utils_s3 import aws_creds_renew
+from utils_date import parse_date_to_std
 
 # Constants
 NO_DATE = pd.NaT
@@ -35,22 +33,6 @@ TIME_FMT = '%Y-%m-%d %H:%M:%S'
 PLATFORM = Literal['PCDS', 'AWS']
 CATEGORY = Literal['dpst', 'loan']
 PARTITION = Literal['snapshot', 'all', 'year', 'month', 'week']
-
-SVC2SERVER = {
-    "pcds_svc": {
-        "server": "PCDS",
-        "auth": "OraPCDSAuth",
-    },
-    "p_uscb_cnsmrlnd_svc": {
-        "server": "PBCS21P",
-        "auth": "OraPBCS21PAuth",
-    },
-    "p_uscb_rft_svc": {
-        "server": "PBCS30P",
-        "auth": "OraPBCS30PAuth",
-    }
-}
-
 
 #>>> Solve LDAP DSN to get TNS connect string <<<#
 def solve_ldap(ldap_dsn: str):
@@ -70,9 +52,9 @@ def solve_ldap(ldap_dsn: str):
 
 
 #>>> Connect to PCDS Oracle database <<<#
-def pcds_connect(service_name):
+def pcds_connect(service_name: str):
+    from constant import SVC2SERVER
     LDAP_DSN = os.environ['LDAP_DSN']
-
     # Determine credentials based on service type
     if service_name.startswith('tmp'):
         usr, pwd = os.environ['TMP_USR'], os.environ['TMP_PWD']
@@ -115,9 +97,8 @@ class SQLengine:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=UserWarning)
             df = psql.read_sql_query(query_stmt, connection, **kwargs)
-
         df.columns = [c.upper() if self.platform == 'PCDS' else c.lower() for c in df.columns]
-        logger.debug(f"Executed query on {self.platform}: {len(df)} rows")
+        False and logger.debug(f"Executed query on {self.platform}: {len(df)} rows")
         return df
 
     #>>> Run query on PCDS Oracle DB <<<#
@@ -143,6 +124,122 @@ proc_pcds = SQLengine('PCDS')
 proc_aws = SQLengine('AWS')
 
 
+COMMON_FORMATS = [
+    "%Y-%m-%d",
+    "%Y/%m/%d",
+    "%d-%m-%Y",
+    "%d/%m/%Y",
+    "%Y%m%d",
+    "%Y-%m-%d %H:%M:%S",
+]
+
+def detect_date_format(date_vals: List):
+    samples = [v for v in date_vals if v and not pd.isna(v)]
+    if not samples:
+        return "unknown", None
+    first = samples[0]
+    if isinstance(first, (datetime, pd.Timestamp)):
+        return "date", None
+
+    s = str(first)
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        return "string", "%Y-%m-%d"
+    if re.match(r"^\d{4}/\d{2}/\d{2}$", s):
+        return "string", "%Y/%m/%d"
+    if re.match(r"^\d{8}$", s):
+        return "string", "%Y%m%d"
+    if re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$", s):
+        return "string", "%Y-%m-%d"
+    
+    try:
+        date_parser.parse(s)
+        return "string", None
+    except Exception:
+        return "string", None
+
+
+@dataclass
+class DateParser:
+    _var: str
+    _type: str = None
+    _fmt: Optional[str] = None
+
+    def __post_init__(self):
+        if self._type.lower().startswith(("date", "time")):
+            self._type = "date"
+        else:
+            self._type = "string"
+    
+    def _get_func(self, service_name = None, data_base = None):
+        if service_name:
+            return ft.partial(proc_pcds, service_name=service_name)
+        else:
+            return ft.partial(proc_aws, data_base=data_base)
+
+    def get_fmt(self, table_name: str, service_name = None, data_base = None):
+        if self._type == "date":
+            self._fmt = None
+            return None
+        func = self._get_func(service_name, data_base)
+        if service_name:
+            sql_stmt = f'SELECT {self._var} FROM {table_name} WHERE ROWNUM = 1'
+        else:
+            sql_stmt = f'SELECT {self._var} FROM {table_name} LIMIT 1'
+        sample_dates = func(sql_stmt)
+        _, fmt = detect_date_format(sample_dates.iloc[0].tolist())
+        self._fmt = fmt
+        return fmt
+
+    def get_cnt(self, table_name: str, where_clause: str, service_name = None, data_base = None):
+        func = self._get_func(service_name, data_base)
+        where = "" if is_missing(where_clause) else f"WHERE {where_clause}"
+        df = func(f"SELECT {self._var}, COUNT(*) as cnt FROM {table_name} {where} GROUP BY {self._var}")
+        df[self._var] = df[self._var].apply(parse_date_to_std)
+        return df
+
+    def to_original(self, input_date: str) -> str:
+        if self._fmt is None:
+            return f"DATE '{input_date}'"
+        else:
+            dt = datetime.strptime(input_date, DATE_FMT)
+            return f"'{dt.strftime(self._fmt)}'"
+
+    def to_standard(self, original_date: str) -> str:
+        if self._fmt is None:
+            return original_date
+        else:
+            dt = datetime.strptime(original_date, self._fmt)
+            return dt.strftime(DATE_FMT)
+
+    def merge_where(self, start_dt, end_dt, where_clause):
+        where_clause = [] if is_missing(where_clause) else [where_clause]
+        if not is_missing(end_dt):
+            where_clause.insert(0, f'{self._var} <= {self.to_original(end_dt)}')
+        if not is_missing(start_dt):
+            where_clause.insert(0, f'{self._var} >= {self.to_original(start_dt)}')
+        return ' AND '.join(where_clause)
+
+    def to_json(self):
+        return json.dumps(asdict(self))
+
+    @classmethod
+    def from_json(cls, json_str: str):
+        return cls(**json.loads(json_str))
+
+
+#>>> Setup logger to output folder <<<#
+def add_logger(folder, name='events'):
+    os.makedirs(folder, exist_ok=True)
+    logger.configure( handlers=[ {"sink": sys.stderr, "level": "INFO"} ])
+    if os.path.exists(fpath := os.path.join(folder, f'{name}.log')):
+        os.remove(fpath)
+    logger.add(fpath, level='INFO', format='{time:YY-MM-DD HH:mm:ss} | {level} | {message}', mode='w')
+
+#>>> Return value of each environment variable name passed <<<#
+def get_env(*args):
+    for env_name in args:
+        yield os.environ.get(env_name)
+
 #>>> Check if value is missing <<<#
 def is_missing(x) -> bool | pd.Series:
     null_like = {"", "nat", "nan", "none", "null"}
@@ -165,12 +262,7 @@ def contain_word(x='', *value) -> bool:
 
 
 #>>> Load configuration from TOML file <<<#
-def load_config(category: CATEGORY):
-    if category == 'dpst':
-        config_file = 'configs/config_meta_dpst.toml'
-    else:
-        config_file = 'configs/config_meta_loan.toml'
-
+def load_config(config_file):
     with open(config_file, "rb") as f:
         config_dict = tomllib.load(f)
     return attridict(config_dict)
@@ -182,7 +274,7 @@ def parse_excel_date(date_input, fmt: str = "%Y-%m-%d") -> str:
         if isinstance(date_input, (int, float)):
             dt = datetime(1899, 12, 30) + timedelta(days=date_input)
         else:
-            dt = parser.parse(str(date_input))
+            dt = date_parser.parse(str(date_input))
         return dt.strftime(fmt)
     except Exception:
         return ''
@@ -198,13 +290,10 @@ def normalize_timestamp(x):
 def parse_where(x: str, func: callable, **kwargs) -> str:
     if not isinstance(x, str):
         return x
-
     if not (m := re.search(r"([^=]+)=\s*\$\{([^}]*)\}", x)):
         return x
-
     key, expr = m.groups()
     value = func(expr, **kwargs).iloc[0, 0]
-
     if value is None:
         formatted_value = "NULL"
     elif isinstance(value, (int, float)):
@@ -220,6 +309,7 @@ def parse_where(x: str, func: callable, **kwargs) -> str:
 
     return f"{key.strip()} = {formatted_value}"
 
+        
 
 #>>> Read input tables from Excel <<<#
 def read_input_tables(config: dict) -> pd.DataFrame:
@@ -247,7 +337,9 @@ def read_input_tables(config: dict) -> pd.DataFrame:
 
     # Normalize start and end dates
     df["start_dt"] = df["start_dt"].apply(parse_excel_date)
-    df["end_dt"] = df["end_dt"].apply(parse_excel_date)
+    df["end_dt"]   = df["end_dt"].apply(parse_excel_date)
+    df['pcds_var'] = df['pcds_var'].str.upper()
+    df['aws_var']  = df['aws_var'].str.lower()
 
     # Clean service/table names
     df["pcds_tbl"] = df["pcds_tbl"].map(extract_name)
@@ -325,138 +417,6 @@ def load_column_mappings(config: dict, category: str) -> pd.DataFrame:
     return combined
 
 
-#>>> Get vintages from data based on partition type <<<#
-def get_vintages_from_data(info_str, date_var, date_type, date_format, partition_type, where_clause="1=1"):
-    import functools as ft
-
-    svc, table_name = info_str.split('.')
-    if date_format == 'YYYY-MM-DD':
-        sql_engine = ft.partial(proc_pcds.query_PCDS, service_name=svc)
-        is_pcds = True
-    else:
-        sql_engine = ft.partial(proc_aws.query_AWS, data_base=svc)
-        table_name = f'{svc}.{table_name}'
-        is_pcds = False
-
-    try:
-        # Parse format if present
-        def parse_format_date(str_w_format):
-            pattern = r'^(.+?)(?:\s*\(([^)]+)\))?$'
-            return re.match(pattern, str_w_format)
-
-        if date_type and ('char' in date_type.lower() or 'varchar' in date_type.lower()):
-            if (m := parse_format_date(date_var)):
-                actual_var, format_spec = m.groups()
-                date_col = f"DATE_PARSE({actual_var}, '{format_spec}')"
-            else:  # PCDS format
-                date_col = f"TO_DATE({date_var}, '{date_format}')"
-        else:
-            date_col = date_var
-
-        match partition_type:
-            case 'year':
-                if is_pcds:
-                    select_clause = f"TO_CHAR({date_col}, 'YYYY')"
-                else:
-                    select_clause = f"DATE_FORMAT({date_col}, '%Y')"
-            case 'year_month':
-                if is_pcds:
-                    select_clause = f"TO_CHAR({date_col}, 'YYYY-MM')"
-                else:
-                    select_clause = f"DATE_FORMAT({date_col}, '%Y-%m')"
-            case _ if partition_type in ('year_week', 'week'):
-                if is_pcds:
-                    select_clause = f"TO_CHAR({date_col}, 'IYYY') || '-W' || LPAD(TO_CHAR({date_col}, 'IW'), 2, '0')"
-                else:
-                    select_clause = f"format_datetime({date_col}, 'xxxx-''W''ww')"
-            case 'snapshot':
-                return ['snapshot']
-            case _:
-                return ['all']
-
-        sql_stmt = f"""
-        SELECT DISTINCT {select_clause} AS vintage
-        FROM {table_name}
-        WHERE {where_clause}
-        ORDER BY vintage DESC
-        """
-        df = sql_engine(sql_stmt)
-        return df.iloc[:, 0].to_list()
-    except Exception as e:
-        logger.error(f"Error getting vintages: {e}")
-        return ['whole']
-
-
-#>>> Load environment variables <<<#
-def load_environment(use_aws: bool = False):
-    if use_aws:
-        load_dotenv('./src/input_aws')
-    else:
-        load_dotenv('./src/input_pcds')
-
-    return {
-        'run_name': os.getenv('RUN_NAME', 'demo'),
-        's3_bucket': os.getenv('S3_BUCKET'),
-        'category': os.getenv('CATEGORY', 'dpst'),
-        'aws_region': os.getenv('AWS_REGION') if use_aws else None
-    }
-
-
-#>>> Get configuration for category <<<#
-def get_config(category: str = None):
-    if category is None:
-        category = os.getenv('CATEGORY', 'dpst')
-    return load_config(category)
-
-
-#>>> Get input tables configuration <<<#
-def get_input_tables(category: str = None):
-    cfg = get_config(category)
-    return read_input_tables(cfg.input['table'])
-
-
-#>>> Get column mappings from crosswalk <<<#
-def get_column_mappings(category: str = None):
-    cfg = get_config(category)
-    return load_column_mappings(cfg.column_maps, category or os.getenv('CATEGORY', 'dpst'))
-
-
-#>>> Get vintages for a table <<<#
-def get_table_vintages(info_str: str, date_var: str, date_type: str,
-                       date_format: str, partition_type: str,
-                       where_clause: str = "1=1"):
-    return get_vintages_from_data(
-        info_str=info_str,
-        date_var=date_var,
-        date_type=date_type,
-        date_format=date_format,
-        partition_type=partition_type,
-        where_clause=where_clause
-    )
-
-
-#>>> Query PCDS Oracle database <<<#
-def query_pcds(sql: str, service_name: str) -> pd.DataFrame:
-    return proc_pcds(sql, service_name=service_name)
-
-
-#>>> Query AWS Athena database <<<#
-def query_aws(sql: str, database: str) -> pd.DataFrame:
-    if inWindows:
-        aws_creds_renew(delta=300)
-    return proc_aws(sql, data_base=database)
-
-
-#>>> Build Oracle hash expression for columns <<<#
-def build_oracle_hash(columns: list) -> str:
-    return utils.build_oracle_hash_expr(columns)
-
-
-#>>> Build Athena hash expression for columns <<<#
-def build_athena_hash(columns: list) -> str:
-    return utils.build_athena_hash_expr(columns)
-
-
 #>>> Get ISO week dates <<<#
 def get_iso_week_dates(year, week):
     import datetime as dt
@@ -467,102 +427,3 @@ def get_iso_week_dates(year, week):
     start, end = max(start, jan01), min(end, dec31)
     return start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d')
 
-
-#>>> Parse exclude date clause <<<#
-def parse_exclude_date(exclude_clause):
-    import datetime as dt
-    p1 = r"TO_CHAR\((?P<col>\w+),\s*'YYYY-MM-DD'\)\s+(?P<op>not in|in)\s+\((?P<dates>.*?)\)"
-    if m := re.match(p1, exclude_clause, flags=re.I):
-        col, op, dates = m.groups()
-        new_dates = ', '.join(f"DATE {date.strip()}" for date in dates.split(','))
-        return '%s %s (%s)' % (col, op, new_dates)
-    p2 = r"DATE_FORMAT\(DATE_PARSE\((?P<col>\w+),\s*'(?P<fmt>%Y%m%d)'\),\s*'%Y-%m-%d'\)\s+(?P<op>not in|in)\s+\((?P<dates>.*?)\)"
-    if m := re.match(p2, exclude_clause, flags=re.I):
-        col, fmt, op, dates = m.groups()
-        new_dates = ', '.join("'%s'" % dt.datetime.strptime(date.strip("'"), '%Y-%m-%d').strftime(fmt) for date in dates.split(','))
-        return '%s %s (%s)' % (col, op, new_dates)
-    return exclude_clause
-
-
-#>>> Get PCDS WHERE clause for date filtering <<<#
-def get_pcds_where(date_var, date_type, date_partition, date_range, date_format, snapshot=None, exclude_clauses=[]):
-    # Handle character-based dates
-    if date_type and ('char' in date_type.lower() or 'varchar' in date_type.lower()):
-        date_var = f"TO_DATE({date_var}, '{date_format}')"
-    if snapshot:
-        # For snapshot queries, just use exclude queries
-        return ' AND '.join(parse_exclude_date(x) for x in exclude_clauses if x)
-    elif date_partition == 'whole':
-        # No date filtering for whole dataset
-        base_clause = "1=1"
-    elif date_partition == 'year':
-        start_dt = f"TO_DATE('{date_range}-01-01', 'YYYY-MM-DD')"
-        end_dt = f"TO_DATE('{date_range}-12-31', 'YYYY-MM-DD')"
-        base_clause = f"{date_var} >= {start_dt} AND {date_var} <= {end_dt}"
-    elif date_partition == 'year_month':
-        start_dt = f"TO_DATE('{date_range}', 'YYYY-MM')"
-        end_dt = f"LAST_DAY(TO_DATE('{date_range}', 'YYYY-MM'))"
-        base_clause = f"{date_var} >= {start_dt} AND {date_var} <= {end_dt}"
-    elif date_partition in ('year_week', 'week'):
-        year, week = date_range.split('-W')
-        start_dt, end_dt = get_iso_week_dates(int(year), int(week))
-        base_clause = f"{date_var} >= DATE '{start_dt}' AND {date_var} <= DATE '{end_dt}'"
-    elif date_partition == 'daily':
-        target_dt = f"TO_DATE('{date_range}', 'YYYY-MM-DD')"
-        base_clause = f"{date_var} = {target_dt}"
-    else:
-        raise ValueError(f"Unsupported partition type: {date_partition}")
-
-    # Add exclusions if provided
-    if (exclude_clauses := [x for x in exclude_clauses if x]):
-        exclude_clause = ' AND '.join(parse_exclude_date(x) for x in exclude_clauses if x)
-        return f"({base_clause}) AND ({exclude_clause})"
-    else:
-        return base_clause
-
-
-#>>> Parse format date <<<#
-def parse_format_date(str_w_format):
-    pattern = r'^(.+?)(?:\s*\(([^)]+)\))?$'
-    return re.match(pattern, str_w_format)
-
-
-#>>> Get AWS WHERE clause for date filtering <<<#
-def get_aws_where(date_var, date_type, date_partition, date_range, date_format, snapshot=None, exclude_clauses=[]):
-    # Handle variable=value format
-    if '=' in date_range:
-        _date_var, date_range = date_range.split('=', 1)
-        assert date_var.split()[0] == _date_var, f"Date Variable Should Match: {date_var} vs {_date_var}"
-    # Extract format from date_var if present (e.g., "dw_bus_dt (%Y%m%d)")
-    if (m := parse_format_date(date_var)):
-        date_var, date_format = m.groups()
-    # Handle string/varchar dates that need parsing
-    if date_type and re.match(r'^(string|varchar)', date_type, re.IGNORECASE):
-        if date_format:
-            date_var = f"DATE_PARSE({date_var}, '{date_format}')"
-        else:
-            date_var = f"DATE_PARSE({date_var}, '%Y%m%d')"  # Default format
-    if snapshot:
-        return ' AND '.join('(%s)' % parse_exclude_date(x) for x in exclude_clauses if x)
-    elif date_partition == 'whole':
-        base_clause = "1=1"
-    elif date_partition == 'year':
-        base_clause = f"DATE_FORMAT({date_var}, '%Y') = '{date_range}'"
-    elif date_partition == 'year_month':
-        base_clause = f"DATE_FORMAT({date_var}, '%Y-%m') = '{date_range}'"
-    elif date_partition in ('year_week', 'week'):
-        if '-W' in date_range:
-            year, week = date_range.split('-W')
-        else:
-            year, week = map(int, date_range.split('-'))
-            week = f"W{week:02d}"
-        base_clause = f"DATE_FORMAT({date_var}, '%Y-%v') = '{year}-{week}'"
-    elif date_partition == 'daily':
-        base_clause = f"DATE({date_var}) = DATE('{date_range}')"
-    else:
-        raise ValueError(f"Unsupported partition type: {date_partition}")
-    if (exclude_clauses := [x for x in exclude_clauses if x]):
-        exclude_clause = ' AND '.join('(%s)' % parse_exclude_date(x) for x in exclude_clauses if x)
-        return f"({base_clause}) AND ({exclude_clause})"
-    else:
-        return base_clause

@@ -1,20 +1,17 @@
 """Part 3: Hash Check Compare - Download PCDS and AWS hashes, compare, generate Excel report."""
+if __name__ == '__main__':
+    from dotenv import load_dotenv
+    load_dotenv('input_pcds')
+
 import os
-import json
+from upath import UPath
 import pandas as pd
 from loguru import logger
-from utils_config import load_env
+
+import constant
+import utils_config as C
 from utils_s3 import S3Manager
 from utils_xlsx import ExcelReporter
-from datetime import datetime
-
-#>>> Setup logger to output folder <<<#
-def add_logger(folder):
-    os.makedirs(folder, exist_ok=True)
-    logger.remove()
-    if os.path.exists(fpath := os.path.join(folder, 'events.log')):
-        os.remove(fpath)
-    logger.add(fpath, level='INFO', format='{time:YY-MM-DD HH:mm:ss} | {level} | {message}', mode='w')
 
 #>>> Compare hashes for a single vintage <<<#
 def compare_vintage_hashes(pcds_hashes, aws_hashes, key_columns):
@@ -129,30 +126,31 @@ def build_consolidated_hash_metadata(pcds_results, aws_results):
 
 #>>> Main execution <<<#
 def main():
-    env = load_env('input_pcds')
-    run_name = env['RUN_NAME']
-    category = env['CATEGORY']
-    s3_bucket = env.get('S3_BUCKET', os.environ.get('S3_BUCKET'))
+    run_name, category, config_path = C.get_env('RUN_NAME', 'CATEGORY', 'HASH_STEP')
 
-    output_folder = f'output/{run_name}'
-    add_logger(output_folder)
-    logger.info(f"Starting hash check comparison: {run_name} / {category}")
+    cfg = C.load_config(config_path)
+    step_name = cfg.output.summary.format(s='hash')
+    output_folder = cfg.output.disk.format(name=run_name)
+    C.add_logger(output_folder, name=step_name)
+    logger.info(f"Starting hash check comparison: {run_name} | {category}")
 
-    s3 = S3Manager(s3_bucket, run_name)
+    s3_bucket = cfg.output.s3.format(name=run_name)
+    s3 = S3Manager(s3_bucket)
 
     logger.info("Downloading PCDS hashes from S3")
-    pcds_results = s3.download_json('hash_check', f'pcds_{category}_hash.json')
+    pcds_results = s3.read_json(f"{cfg.output.step_name.format(p='pcds')}.json")
 
     logger.info("Downloading AWS hashes from S3")
-    aws_results = s3.download_json('hash_check', f'aws_{category}_hash.json')
+    aws_results = s3.read_json(f"{cfg.output.step_name.format(p='aws')}.json")
 
     consolidated = build_consolidated_hash_metadata(pcds_results, aws_results)
-    s3.upload_json(consolidated, '', f'{category}_hash_check.json')
-    logger.info(f"Uploaded consolidated hash_check.json to S3")
 
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    report_path = os.path.join(output_folder, f'hash_check_comparison_{category}_{timestamp}.xlsx')
+    local_path = os.path.join(output_folder, f'{step_name}.json')
+    s3.write_json(consolidated, UPath(local_path))
+    s3.write_json(consolidated, f'{step_name}.json')
+    logger.info(f"Uploaded consolidated hash check to S3")
 
+    report_path = os.path.join(output_folder, f'{step_name}.xlsx')
     logger.info(f"Generating Excel report: {report_path}")
 
     with ExcelReporter(report_path) as reporter:
